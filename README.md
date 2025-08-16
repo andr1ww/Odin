@@ -39,7 +39,7 @@ func main() {
     defer odin.CloseAll()
 
     user := &User{
-        Bucket: odin.Bucket{ID: "KeyValue"},
+        Bucket: odin.Bucket{ID: "Key"},
         Name:   "Andrew",
         Email:  "andrew@example.com",
     }
