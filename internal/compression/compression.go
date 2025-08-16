@@ -7,6 +7,7 @@ import (
 	"compress/lzw"
 	"compress/zlib"
 	"io"
+	"sync"
 )
 
 const (
@@ -16,6 +17,35 @@ const (
 	Flate
 	LZW
 	threshold = 50
+)
+
+var (
+	gzipReaderPool = sync.Pool{
+		New: func() interface{} {
+			return &gzip.Reader{}
+		},
+	}
+	zlibReaderPool = sync.Pool{
+		New: func() interface{} {
+			r, _ := zlib.NewReader(nil)
+			return r
+		},
+	}
+	flateReaderPool = sync.Pool{
+		New: func() interface{} {
+			return flate.NewReader(nil)
+		},
+	}
+	lzwReaderPool = sync.Pool{
+		New: func() interface{} {
+			return lzw.NewReader(nil, lzw.LSB, 8)
+		},
+	}
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 1024)
+		},
+	}
 )
 
 func CompressData(data []byte) []byte {
@@ -30,10 +60,10 @@ func CompressData(data []byte) []byte {
 		id   byte
 		comp func([]byte) ([]byte, error)
 	}{
-		{LZW, compressLZW},
-		{Flate, compressFlate},
-		{Zlib, compressZlib},
 		{Gzip, compressGzip},
+		{Zlib, compressZlib},
+		{Flate, compressFlate},
+		{LZW, compressLZW},
 	}
 
 	best := data
@@ -62,7 +92,7 @@ func compressLZW(data []byte) ([]byte, error) {
 
 func compressFlate(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	writer, _ := flate.NewWriter(&buf, flate.BestCompression)
+	writer, _ := flate.NewWriter(&buf, flate.DefaultCompression)
 	_, err := writer.Write(data)
 	writer.Close()
 	return buf.Bytes(), err
@@ -70,7 +100,7 @@ func compressFlate(data []byte) ([]byte, error) {
 
 func compressZlib(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	writer, _ := zlib.NewWriterLevel(&buf, zlib.BestCompression)
+	writer, _ := zlib.NewWriterLevel(&buf, zlib.DefaultCompression)
 	_, err := writer.Write(data)
 	writer.Close()
 	return buf.Bytes(), err
@@ -78,7 +108,7 @@ func compressZlib(data []byte) ([]byte, error) {
 
 func compressGzip(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	writer, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	writer, _ := gzip.NewWriterLevel(&buf, gzip.DefaultCompression)
 	_, err := writer.Write(data)
 	writer.Close()
 	return buf.Bytes(), err
@@ -91,11 +121,18 @@ func DecompressData(data []byte) []byte {
 
 	if len(data) > 0 && (data[0] == 0 || data[0] == 1) {
 		if data[0] == 1 {
-			if gzReader, err := gzip.NewReader(bytes.NewReader(data[1:])); err == nil {
-				defer gzReader.Close()
-				if result, err := io.ReadAll(gzReader); err == nil {
+			reader := gzipReaderPool.Get().(*gzip.Reader)
+			defer gzipReaderPool.Put(reader)
+
+			if err := reader.Reset(bytes.NewReader(data[1:])); err == nil {
+				buf := bufferPool.Get().([]byte)
+				defer bufferPool.Put(buf[:0])
+
+				if result, err := io.ReadAll(reader); err == nil {
+					reader.Close()
 					return result
 				}
+				reader.Close()
 			}
 		}
 		return data[1:]
@@ -109,40 +146,71 @@ func DecompressData(data []byte) []byte {
 		case None:
 			return compressedData
 		case Gzip:
-			if reader, err := gzip.NewReader(bytes.NewReader(compressedData)); err == nil {
-				defer reader.Close()
+			reader := gzipReaderPool.Get().(*gzip.Reader)
+			defer gzipReaderPool.Put(reader)
+
+			if err := reader.Reset(bytes.NewReader(compressedData)); err == nil {
 				if result, err := io.ReadAll(reader); err == nil {
+					reader.Close()
 					return result
 				}
+				reader.Close()
 			}
 		case Zlib:
-			if reader, err := zlib.NewReader(bytes.NewReader(compressedData)); err == nil {
-				defer reader.Close()
-				if result, err := io.ReadAll(reader); err == nil {
-					return result
+			reader := zlibReaderPool.Get().(io.ReadCloser)
+			defer zlibReaderPool.Put(reader)
+
+			if zlibReader, ok := reader.(interface{ Reset(io.Reader, []byte) error }); ok {
+				if err := zlibReader.Reset(bytes.NewReader(compressedData), nil); err == nil {
+					if result, err := io.ReadAll(reader); err == nil {
+						reader.Close()
+						return result
+					}
+					reader.Close()
+				}
+			} else {
+				if reader, err := zlib.NewReader(bytes.NewReader(compressedData)); err == nil {
+					defer reader.Close()
+					if result, err := io.ReadAll(reader); err == nil {
+						return result
+					}
 				}
 			}
 		case Flate:
-			reader := flate.NewReader(bytes.NewReader(compressedData))
-			defer reader.Close()
-			if result, err := io.ReadAll(reader); err == nil {
-				return result
+			reader := flateReaderPool.Get().(io.ReadCloser)
+			defer flateReaderPool.Put(reader)
+
+			if flateReader, ok := reader.(flate.Resetter); ok {
+				flateReader.Reset(bytes.NewReader(compressedData), nil)
+				if result, err := io.ReadAll(reader); err == nil {
+					reader.Close()
+					return result
+				}
+				reader.Close()
+			} else {
+				reader := flate.NewReader(bytes.NewReader(compressedData))
+				defer reader.Close()
+				if result, err := io.ReadAll(reader); err == nil {
+					return result
+				}
 			}
 		case LZW:
-			reader := lzw.NewReader(bytes.NewReader(compressedData), lzw.LSB, 8)
-			defer reader.Close()
-			if result, err := io.ReadAll(reader); err == nil {
+			if result, err := io.ReadAll(lzw.NewReader(bytes.NewReader(compressedData), lzw.LSB, 8)); err == nil {
 				return result
 			}
 		}
 	}
 
 	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-		if gzReader, err := gzip.NewReader(bytes.NewReader(data)); err == nil {
-			defer gzReader.Close()
-			if result, err := io.ReadAll(gzReader); err == nil {
+		reader := gzipReaderPool.Get().(*gzip.Reader)
+		defer gzipReaderPool.Put(reader)
+
+		if err := reader.Reset(bytes.NewReader(data)); err == nil {
+			if result, err := io.ReadAll(reader); err == nil {
+				reader.Close()
 				return result
 			}
+			reader.Close()
 		}
 	}
 

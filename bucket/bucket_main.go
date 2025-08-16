@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,32 @@ import (
 	"github.com/andr1ww/odin/internal/compression"
 	"github.com/andr1ww/odin/internal/indexing"
 	"github.com/andr1ww/odin/internal/reflection"
+)
+
+var (
+	gzipReaderPool = sync.Pool{
+		New: func() interface{} {
+			return &gzip.Reader{}
+		},
+	}
+	workerPool = sync.Pool{
+		New: func() interface{} {
+			slice := make([]interface{}, 0, 200)
+			return &slice
+		},
+	}
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return &bytes.Buffer{}
+		},
+	}
+	dataBufferPool = sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, 0, 4096)
+			return &buf
+		},
+	}
+	fieldMatcherCache = sync.Map{}
 )
 
 func Find(bucketName string, id string, entity interface{}) error {
@@ -67,11 +95,46 @@ func FindWhereInDatabase(dbName, bucketName string, criteria map[string]interfac
 		return nil, err
 	}
 
-	if indexing.HasIndex(bucketName) && len(criteria) == 1 {
-		for field, value := range criteria {
-			if keys, found := indexing.GetIndexedKeys(bucketName, field, value); found {
-				results := make([]interface{}, 0, len(keys))
-				for _, key := range keys {
+	if indexing.HasIndex(bucketName) {
+		if len(criteria) == 1 {
+			for field, value := range criteria {
+				if keys, found := indexing.GetIndexedKeys(bucketName, field, value); found {
+					results := make([]interface{}, 0, len(keys))
+					for _, key := range keys {
+						entity := constructor()
+						if err := db.Get(bucketName, key, entity); err == nil {
+							results = append(results, entity)
+						}
+					}
+					return results, nil
+				}
+			}
+		}
+
+		if len(criteria) > 1 {
+			var candidateKeys []string
+			firstField := true
+
+			for field, value := range criteria {
+				if keys, found := indexing.GetIndexedKeys(bucketName, field, value); found {
+					if firstField {
+						candidateKeys = keys
+						firstField = false
+					} else {
+						candidateKeys = intersectStringSlices(candidateKeys, keys)
+						if len(candidateKeys) == 0 {
+							return []interface{}{}, nil
+						}
+					}
+				} else {
+					candidateKeys = nil
+					break
+				}
+			}
+
+			if candidateKeys != nil {
+				results := make([]interface{}, 0, len(candidateKeys))
+				for _, key := range candidateKeys {
 					entity := constructor()
 					if err := db.Get(bucketName, key, entity); err == nil {
 						results = append(results, entity)
@@ -84,10 +147,20 @@ func FindWhereInDatabase(dbName, bucketName string, criteria map[string]interfac
 
 	sampleEntity := constructor()
 	entityType := reflect.TypeOf(sampleEntity).Elem()
-	matcher := reflection.GetFieldMatcher(entityType)
 
-	var results []interface{}
-	const numWorkers = 4
+	var matcher *reflection.FieldMatcher
+	if cached, ok := fieldMatcherCache.Load(entityType); ok {
+		matcher = cached.(*reflection.FieldMatcher)
+	} else {
+		matcher = reflection.GetFieldMatcher(entityType)
+		fieldMatcherCache.Store(entityType, matcher)
+	}
+
+	numWorkers := runtime.NumCPU()
+	if numWorkers > 6 {
+		numWorkers = 6
+	}
+
 	workChan := make(chan []byte, numWorkers*2)
 	resultChan := make(chan []interface{}, numWorkers)
 	var wg sync.WaitGroup
@@ -96,7 +169,24 @@ func FindWhereInDatabase(dbName, bucketName string, criteria map[string]interfac
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			localResults := make([]interface{}, 0, 100)
+			localResultsPtr := workerPool.Get().(*[]interface{})
+			localResults := *localResultsPtr
+			defer func() {
+				*localResultsPtr = (*localResultsPtr)[:0]
+				workerPool.Put(localResultsPtr)
+			}()
+
+			buffer := bufferPool.Get().(*bytes.Buffer)
+			defer func() {
+				buffer.Reset()
+				bufferPool.Put(buffer)
+			}()
+
+			dataBufferPtr := dataBufferPool.Get().(*[]byte)
+			defer func() {
+				*dataBufferPtr = (*dataBufferPtr)[:0]
+				dataBufferPool.Put(dataBufferPtr)
+			}()
 
 			for data := range workChan {
 				if len(data) == 0 {
@@ -106,18 +196,34 @@ func FindWhereInDatabase(dbName, bucketName string, criteria map[string]interfac
 				var actualData []byte
 				if len(data) > 0 && (data[0] == 0 || data[0] == 1) {
 					if data[0] == 1 {
-						gzReader, err := gzip.NewReader(bytes.NewReader(data[1:]))
-						if err != nil {
-							actualData = data
-						} else {
-							var buf bytes.Buffer
-							if _, err := buf.ReadFrom(gzReader); err != nil {
-								actualData = data
-							} else {
-								actualData = buf.Bytes()
+						reader := gzipReaderPool.Get().(*gzip.Reader)
+						if err := reader.Reset(bytes.NewReader(data[1:])); err == nil {
+							*dataBufferPtr = (*dataBufferPtr)[:0]
+
+							chunk := make([]byte, 4096)
+							for {
+								n, err := reader.Read(chunk)
+								if n > 0 {
+									*dataBufferPtr = append(*dataBufferPtr, chunk[:n]...)
+								}
+								if err == io.EOF {
+									break
+								}
+								if err != nil {
+									actualData = data
+									break
+								}
 							}
-							gzReader.Close()
+
+							if actualData == nil {
+								actualData = make([]byte, len(*dataBufferPtr))
+								copy(actualData, *dataBufferPtr)
+							}
+							reader.Close()
+						} else {
+							actualData = data
 						}
+						gzipReaderPool.Put(reader)
 					} else {
 						actualData = data[1:]
 					}
@@ -126,7 +232,12 @@ func FindWhereInDatabase(dbName, bucketName string, criteria map[string]interfac
 				}
 
 				entity := constructor()
-				if err := json.Unmarshal(actualData, entity); err != nil {
+
+				buffer.Reset()
+				buffer.Write(actualData)
+				decoder := json.NewDecoder(buffer)
+
+				if err := decoder.Decode(entity); err != nil {
 					continue
 				}
 
@@ -135,7 +246,13 @@ func FindWhereInDatabase(dbName, bucketName string, criteria map[string]interfac
 				}
 			}
 
-			resultChan <- localResults
+			if len(localResults) > 0 {
+				resultCopy := make([]interface{}, len(localResults))
+				copy(resultCopy, localResults)
+				resultChan <- resultCopy
+			} else {
+				resultChan <- nil
+			}
 		}()
 	}
 
@@ -146,7 +263,7 @@ func FindWhereInDatabase(dbName, bucketName string, criteria map[string]interfac
 			copy(dataCopy, v)
 			select {
 			case workChan <- dataCopy:
-			case <-time.After(5 * time.Second):
+			case <-time.After(10 * time.Second):
 				return fmt.Errorf("timeout writing to work channel")
 			}
 			return nil
@@ -158,18 +275,46 @@ func FindWhereInDatabase(dbName, bucketName string, criteria map[string]interfac
 		close(resultChan)
 	}()
 
-	timeout := time.After(30 * time.Second)
+	var results []interface{}
+	timeout := time.After(60 * time.Second)
 	for {
 		select {
 		case localResults, ok := <-resultChan:
 			if !ok {
 				return results, nil
 			}
-			results = append(results, localResults...)
+			if localResults != nil {
+				results = append(results, localResults...)
+			}
 		case <-timeout:
 			return nil, fmt.Errorf("timeout waiting for results")
 		}
 	}
+}
+
+func intersectStringSlices(a, b []string) []string {
+	if len(a) == 0 || len(b) == 0 {
+		return []string{}
+	}
+
+	if len(b) < len(a) {
+		a, b = b, a
+	}
+
+	bMap := make(map[string]bool, len(b))
+	for _, item := range b {
+		bMap[item] = true
+	}
+
+	var result []string
+	for _, item := range a {
+		if bMap[item] {
+			result = append(result, item)
+			delete(bMap, item)
+		}
+	}
+
+	return result
 }
 
 func CreateInDatabase(dbName string, entity interface{}) error {

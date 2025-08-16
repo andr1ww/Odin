@@ -14,37 +14,36 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-var bucketNameCache = make(map[reflect.Type]string)
-var bucketNameMutex sync.RWMutex
+var bucketNameCache = sync.Map{}
 
 type FieldMatcher struct {
 	FieldMap map[string]int
 	JsonMap  map[string]int
+	Fields   []reflect.StructField
 }
 
-var matcherCache = make(map[reflect.Type]*FieldMatcher)
-var matcherMutex sync.RWMutex
+var matcherCache = sync.Map{}
 
 func GetFieldMatcher(typ reflect.Type) *FieldMatcher {
-	matcherMutex.RLock()
-	if matcher, exists := matcherCache[typ]; exists {
-		matcherMutex.RUnlock()
-		return matcher
+	if matcher, exists := matcherCache.Load(typ); exists {
+		return matcher.(*FieldMatcher)
 	}
-	matcherMutex.RUnlock()
 
+	numFields := typ.NumField()
 	matcher := &FieldMatcher{
-		FieldMap: make(map[string]int),
-		JsonMap:  make(map[string]int),
+		FieldMap: make(map[string]int, numFields),
+		JsonMap:  make(map[string]int, numFields),
+		Fields:   make([]reflect.StructField, numFields),
 	}
 
-	for i := 0; i < typ.NumField(); i++ {
+	for i := 0; i < numFields; i++ {
 		field := typ.Field(i)
+		matcher.Fields[i] = field
 		matcher.FieldMap[field.Name] = i
 
 		jsonTag := field.Tag.Get("json")
 		if jsonTag != "" {
-			if comma := strings.Index(jsonTag, ","); comma != -1 {
+			if comma := strings.IndexByte(jsonTag, ','); comma != -1 {
 				jsonTag = jsonTag[:comma]
 			}
 			if jsonTag != "" && jsonTag != "-" {
@@ -53,10 +52,9 @@ func GetFieldMatcher(typ reflect.Type) *FieldMatcher {
 		}
 	}
 
-	matcherMutex.Lock()
-	matcherCache[typ] = matcher
-	matcherMutex.Unlock()
-
+	if cached, loaded := matcherCache.LoadOrStore(typ, matcher); loaded {
+		return cached.(*FieldMatcher)
+	}
 	return matcher
 }
 
@@ -77,9 +75,25 @@ func MatchesCriteria(entity interface{}, criteria map[string]interface{}, matche
 	}
 
 	for key, expectedValue := range criteria {
-		fieldValue, found := matcher.GetFieldValue(entityValue, key)
-		if !found || !reflect.DeepEqual(fieldValue, expectedValue) {
+		var fieldValue interface{}
+		var found bool
+
+		if idx, exists := matcher.JsonMap[key]; exists {
+			fieldValue = entityValue.Field(idx).Interface()
+			found = true
+		} else if idx, exists := matcher.FieldMap[key]; exists {
+			fieldValue = entityValue.Field(idx).Interface()
+			found = true
+		}
+
+		if !found {
 			return false
+		}
+
+		if fieldValue != expectedValue {
+			if !reflect.DeepEqual(fieldValue, expectedValue) {
+				return false
+			}
 		}
 	}
 	return true
@@ -100,17 +114,15 @@ func GetBucketName(v interface{}) (string, error) {
 	}
 
 	typ := val.Type()
-	bucketNameMutex.RLock()
-	if cached, exists := bucketNameCache[typ]; exists {
-		bucketNameMutex.RUnlock()
-		return cached, nil
+	if cached, exists := bucketNameCache.Load(typ); exists {
+		return cached.(string), nil
 	}
-	bucketNameMutex.RUnlock()
 
 	var bucketName string
 	found := false
+	numFields := typ.NumField()
 
-	for i := 0; i < typ.NumField(); i++ {
+	for i := 0; i < numFields; i++ {
 		field := typ.Field(i)
 
 		if field.Type.Name() == "Bucket" {
@@ -136,10 +148,9 @@ func GetBucketName(v interface{}) (string, error) {
 		bucketName = structName
 	}
 
-	bucketNameMutex.Lock()
-	bucketNameCache[typ] = bucketName
-	bucketNameMutex.Unlock()
-
+	if cached, loaded := bucketNameCache.LoadOrStore(typ, bucketName); loaded {
+		return cached.(string), nil
+	}
 	return bucketName, nil
 }
 
@@ -158,7 +169,9 @@ func GetBucketDatabase(v interface{}) (string, error) {
 	}
 
 	typ := val.Type()
-	for i := 0; i < typ.NumField(); i++ {
+	numFields := typ.NumField()
+
+	for i := 0; i < numFields; i++ {
 		field := typ.Field(i)
 
 		if field.Type.Name() == "Bucket" {
@@ -201,6 +214,11 @@ func FindAndInitBuckets(db *bolt.DB, dbName string) error {
 	})
 }
 
+var ignoredStructs = map[string]bool{
+	"Bucket": true,
+	"DB":     true,
+}
+
 func findBucketsForDatabase(dbName string) ([]string, error) {
 	buckets := make(map[string]struct{})
 
@@ -211,11 +229,6 @@ func findBucketsForDatabase(dbName string) ([]string, error) {
 
 	result := make([]string, 0, len(buckets))
 	for bucket := range buckets {
-		var ignoredStructs = map[string]bool{
-			"Bucket": true,
-			"DB":     true,
-		}
-
 		if ignoredStructs[bucket] {
 			continue
 		}
@@ -247,31 +260,36 @@ func scanForBuckets(rootDir string, buckets map[string]struct{}, targetDB string
 			}
 
 			contentStr := string(content)
+			if !strings.Contains(contentStr, ".Bucket") || !strings.Contains(contentStr, targetDB) {
+				return nil
+			}
+
 			lines := strings.Split(contentStr, "\n")
 
 			for _, line := range lines {
 				line = strings.TrimSpace(line)
-				if strings.Contains(line, ".Bucket") && strings.Contains(line, "`") {
-					bucketName := ""
-					dbName := ""
+				if !strings.Contains(line, ".Bucket") || !strings.Contains(line, "`") {
+					continue
+				}
 
-					if bucketStart := strings.Index(line, "bucket:\""); bucketStart != -1 {
-						bucketStart += 8
-						if bucketEnd := strings.Index(line[bucketStart:], "\""); bucketEnd != -1 {
-							bucketName = line[bucketStart : bucketStart+bucketEnd]
-						}
-					}
+				var bucketName, dbName string
 
-					if dbStart := strings.Index(line, "database:\""); dbStart != -1 {
-						dbStart += 10
-						if dbEnd := strings.Index(line[dbStart:], "\""); dbEnd != -1 {
-							dbName = line[dbStart : dbStart+dbEnd]
-						}
+				if bucketStart := strings.Index(line, "bucket:\""); bucketStart != -1 {
+					bucketStart += 8
+					if bucketEnd := strings.Index(line[bucketStart:], "\""); bucketEnd != -1 {
+						bucketName = line[bucketStart : bucketStart+bucketEnd]
 					}
+				}
 
-					if bucketName != "" && dbName != "" && dbName == targetDB {
-						buckets[bucketName] = struct{}{}
+				if dbStart := strings.Index(line, "database:\""); dbStart != -1 {
+					dbStart += 10
+					if dbEnd := strings.Index(line[dbStart:], "\""); dbEnd != -1 {
+						dbName = line[dbStart : dbStart+dbEnd]
 					}
+				}
+
+				if bucketName != "" && dbName == targetDB {
+					buckets[bucketName] = struct{}{}
 				}
 			}
 		}
