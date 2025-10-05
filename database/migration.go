@@ -248,10 +248,10 @@ func (db *DB) Compact() error {
 
 	tempDB, err := bolt.Open(tempPath, 0600, &bolt.Options{
 		Timeout:         10 * time.Second,
-		InitialMmapSize: 1000 * 1024 * 1024,
+		InitialMmapSize: 10 * 1024 * 1024,
 		PageSize:        8096,
 		NoSync:          false,
-		NoFreelistSync:  true,
+		NoFreelistSync:  false,
 		FreelistType:    bolt.FreelistMapType,
 		NoGrowSync:      true,
 		MmapFlags:       0,
