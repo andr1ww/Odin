@@ -26,7 +26,7 @@ type DB struct {
 func openDatabase(name, dbPath string) (*DB, error) {
 	boltDB, err := bolt.Open(dbPath, 0600, &bolt.Options{
 		Timeout:         10 * time.Second,
-		InitialMmapSize: 1000 * 1024 * 1024,
+		InitialMmapSize: 10 * 1024 * 1024,
 		PageSize:        8096,
 		NoSync:          false,
 		NoFreelistSync:  true,
