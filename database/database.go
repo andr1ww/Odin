@@ -29,7 +29,7 @@ func openDatabase(name, dbPath string) (*DB, error) {
 		InitialMmapSize: 10 * 1024 * 1024,
 		PageSize:        8096,
 		NoSync:          false,
-		NoFreelistSync:  true,
+		NoFreelistSync:  false,
 		FreelistType:    bolt.FreelistMapType,
 		NoGrowSync:      true,
 		MmapFlags:       0,
